@@ -96,49 +96,60 @@ const registerUser = asyncHandler(async(req,res) =>{
    )
 })
 
-const loginUser = asyncHandler(async(req,res) =>{
-    const {email, username, password} = req.body
+const loginUser = asyncHandler(async (req, res) => {
+  const { email, username, password } = req.body;
 
-    if(!username  && !email){
-        throw new ApiError(400, "username or email is required")
-    }
+  if (!username && !email) {
+    throw new ApiError(400, "username or email is required");
+  }
 
-    const user = await User.findOne({
-        $or: [{username},{email}]
-    })
+  const user = await User.findOne({
+    $or: [{ username }, { email }],
+  });
 
-    if(!user){
-        throw new ApiError(404, "User does not exist, Register first")
-    }
+  if (!user) {
+    throw new ApiError(404, "User does not exist, Register first");
+  }
 
-    const isPasswordValid = await user.isPasswordCorrect(password)
+  const isPasswordValid = await user.isPasswordCorrect(password);
 
-    if(!isPasswordValid){
-        throw new ApiError(401, "Invalid user credentials")
-    }
+  if (!isPasswordValid) {
+    throw new ApiError(401, "Invalid user credentials");
+  }
 
-    const {accessToken, refreshToken} = 
-    await generateAccessAndRefreshTokens(user._id);
+  // generate tokens (you already had this)
+  const { accessToken, refreshToken } = await generateAccessAndRefreshTokens(user._id);
 
-    const loggedInUser = await User.findById(user._id).select("-password -refreshToken")
+  // get safe user object (remove password and refreshToken)
+  const loggedInUser = await User.findById(user._id).select("-password -refreshToken");
 
-    const options = {
-        httpOnly : true,
-        secure: true
-    }
-    return res
-    .status(200)
-    .cookie("accessToken",accessToken, options)
-    .cookie("refreshToken",refreshToken,options)
-    .json(
-        new ApiResponse(
-            200,{
-                user: loggedInUser
-            },
-            "User logged in Successfully"
-        )
+  // Cookie options: secure only in production
+  const cookieOptions = {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+    // optionally set an expires or maxAge if you want:
+    // maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  };
+
+  // Set cookies (keeps your existing cookie behavior)
+  res.cookie("accessToken", accessToken, cookieOptions);
+  res.cookie("refreshToken", refreshToken, cookieOptions);
+
+  // ALSO return accessToken in response body so frontend can read/store it
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      {
+        user: loggedInUser,
+        accessToken, // frontend will read wrapper.data.accessToken
+        // refreshToken // optional: include only if needed; usually keep refresh token in httpOnly cookie only
+      },
+      "User logged in Successfully"
     )
-})
+  );
+});
+
 
 const logoutUser = asyncHandler(async(req,res)=>{
     await User.findByIdAndUpdate(req.user._id,{

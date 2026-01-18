@@ -7,13 +7,14 @@ import {
     getVideoById,
     updateVideo,
     publishAVideo,
-    togglePublishStatus
+    togglePublishStatus,
+    getMyVideos
 } from "../controllers/video.controller.js";
 
 const router = Router();
 
 // router.use(verifyJWT); // Apply verifyJWT middleware to all routes in this file
-
+router.route("/my").get(verifyJWT, getMyVideos);
 router
     .route("/")
     .get(getAllVideos)

@@ -10,7 +10,20 @@ import {
 import ApiResponse from "../utils/ApiResponse.js";
 import mongoose, { isValidObjectId } from "mongoose";
 import { Like } from "../models/like.model.js";
+import fs from "fs";
 
+const getMyVideos = asyncHandler(async (req, res) => {
+  // show ALL videos owned by this user: published + drafts
+  const videos = await Video.find({ owner: req.user._id })
+    .sort({ createdAt: -1 })
+    .populate("owner", "username avatar");
+
+  return res
+    .status(200)
+    .json(
+      new ApiResponse(200, videos, "My videos fetched successfully")
+    );
+});
 // get all videos based on query, sort, pagination
 const getAllVideos = asyncHandler(async (req, res) => {
     const { page = 1, limit = 10, query, sortBy, sortType, userId } = req.query;
@@ -93,212 +106,198 @@ const getAllVideos = asyncHandler(async (req, res) => {
         .json(new ApiResponse(200, video, "Videos fetched successfully"));
 });
 
+const safeUnlink = (path) => {
+  try { if (path && fs.existsSync(path)) fs.unlinkSync(path); } catch (e) { /* ignore */ }
+};
+
 const publishAVideo = asyncHandler(async (req, res) => {
   const { title, description } = req.body;
 
-  // if you want title/description optional, remove this check.
-  // Current behaviour: require non-empty title & description strings.
-  if ([title, description].some((field) => typeof field !== "string" || field.trim() === "")) {
-    throw new ApiError(400, "title and description are required");
+  if ([title, description].some((field) => field?.trim() === "")) {
+    throw new ApiError(400, "All fields are required");
   }
 
-  // safe access to multer paths
   const videoFileLocalPath = req.files?.videoFile?.[0]?.path;
   const thumbnailLocalPath = req.files?.thumbnail?.[0]?.path;
 
-  if (!videoFileLocalPath) {
-    throw new ApiError(400, "videoFile is required");
+  if (!videoFileLocalPath) throw new ApiError(400, "videoFileLocalPath is required");
+  if (!thumbnailLocalPath) throw new ApiError(400, "thumbnailLocalPath is required");
+
+  // OPTIONAL: compute hash to prevent duplicate uploads
+  // const fileBuffer = fs.readFileSync(videoFileLocalPath);
+  // const fileHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+  // const existing = await Video.findOne({ fileHash });
+  // if (existing) {
+  //   // cleanup local files and return error
+  //   safeUnlink(videoFileLocalPath);
+  //   safeUnlink(thumbnailLocalPath);
+  //   throw new ApiError(409, "This video file was already uploaded");
+  // }
+
+  // Uploads (assumes uploadOnCloudinary returns an object with secure_url, public_id, duration)
+  let videoFile, thumbnail;
+  try {
+    videoFile = await uploadOnCloudinary(videoFileLocalPath, { resource_type: "video" });
+    thumbnail = await uploadOnCloudinary(thumbnailLocalPath, { resource_type: "image" });
+  } catch (err) {
+    // ensure temp files removed
+    safeUnlink(videoFileLocalPath);
+    safeUnlink(thumbnailLocalPath);
+    throw new ApiError(500, "Cloudinary upload failed: " + (err.message || err));
   }
 
-  if (!thumbnailLocalPath) {
-    throw new ApiError(400, "thumbnail is required");
+  if (!videoFile || !videoFile.public_id) {
+    safeUnlink(videoFileLocalPath);
+    safeUnlink(thumbnailLocalPath);
+    throw new ApiError(400, "Video file upload failed");
   }
 
-  // Upload to Cloudinary (your util)
-  const uploadedVideo = await uploadOnCloudinary(videoFileLocalPath, { resource_type: "video" });
-  const uploadedThumb = await uploadOnCloudinary(thumbnailLocalPath, { resource_type: "image" });
-
-  if (!uploadedVideo) {
-    throw new ApiError(400, "Video upload failed");
-  }
-  if (!uploadedThumb) {
+  if (!thumbnail || !thumbnail.public_id) {
+    safeUnlink(videoFileLocalPath);
+    safeUnlink(thumbnailLocalPath);
     throw new ApiError(400, "Thumbnail upload failed");
   }
 
-  // helper to extract a URL string from cloudinary result
-  const getUrl = (obj) => {
-    if (!obj) return "";
-    if (typeof obj === "string") return obj;
-    if (obj.secure_url) return obj.secure_url;
-    if (obj.url) return obj.url;
-    // fallback: try to find a string field containing /upload/
-    for (const k of Object.keys(obj)) {
-      if (typeof obj[k] === "string" && obj[k].includes("/upload/")) return obj[k];
-    }
-    return "";
-  };
-
-  const videoUrl = getUrl(uploadedVideo);
-  const thumbUrl = getUrl(uploadedThumb);
-
-  if (!videoUrl) {
-    return res.status(400).json(new ApiResponse(400, null, "Unable to get video URL from Cloudinary response"));
-  }
-
-  // Build document using STRING URLs (this fixes your ValidationError)
-  const videoDoc = {
-    title: title || "Untitled",
-    description: description || "",
-    duration: uploadedVideo.duration || undefined,
-    videoFile: videoUrl,     // store string URL
-    thumbnail: thumbUrl || "", // store string URL
-    owner: req.user?._id || null,
+  // Create DB doc
+  const video = await Video.create({
+    title,
+    description,
+    duration: videoFile.duration ?? undefined,
+    // store secure_url if present, else fallback to url
+    videoFile: {
+      url: videoFile.secure_url ?? videoFile.url,
+      public_id: videoFile.public_id,
+      format: videoFile.format
+    },
+    thumbnail: {
+      url: thumbnail.secure_url ?? thumbnail.url,
+      public_id: thumbnail.public_id
+    },
+    owner: req.user?._id,
     isPublished: false,
-  };
-
-  // create and return
-  const created = await Video.create(videoDoc);
-
-  console.log("Saved video doc:", {
-    id: created._id,
-    videoFile: created.videoFile,
-    thumbnail: created.thumbnail,
+    // OPTIONAL: fileHash
+    // fileHash
   });
 
-  return res.status(201).json(new ApiResponse(201, created, "Video uploaded successfully"));
+  // cleanup local files (best-effort)
+  safeUnlink(videoFileLocalPath);
+  safeUnlink(thumbnailLocalPath);
+
+  // Return clear response with mongo id
+  return res
+    .status(201) // CREATED
+    .json(new ApiResponse(201, {
+      _id: video._id,
+      title: video.title,
+      description: video.description,
+      videoUrl: video.videoFile.url,
+      thumbnailUrl: video.thumbnail.url,
+      public_id: video.videoFile.public_id // optional debugging-only
+    }, "Video uploaded successfully"));
 });
 
+const getVideoById = asyncHandler(async (req, res) => {
+  const { videoId } = req.params;
 
-const getVideoById = asyncHandler(async(req, res) => {
-    const {videoId} = req.params;
+  if (!isValidObjectId(videoId)) {
+    throw new ApiError(400, "Invalid videoId (expected MongoDB ObjectId)");
+  }
 
-    if(!isValidObjectId(videoId)){
-        throw new ApiError(400, "Invalid videoId");
-    }
+  if (!isValidObjectId(req.user?._id)) {
+    throw new ApiError(400, "Invalid userId");
+  }
 
-    if(!isValidObjectId(req.user?._id)){
-        throw new ApiError(400, "Invalid userId");
-    }
+  // convert user id to ObjectId to avoid type mismatch inside aggregation
+  const userObjectId = new mongoose.Types.ObjectId(req.user._id);
 
-    const video = await Video.aggregate([
-        {
-            $match: {
-                _id: new mongoose.Types.ObjectId(videoId)
-            }
-        },
-        {
+  const results = await Video.aggregate([
+    { $match: { _id: new mongoose.Types.ObjectId(videoId) } },
+    {
+      $lookup: {
+        from: "likes",
+        localField: "_id",
+        foreignField: "video",
+        as: "likes",
+      }
+    },
+    {
+      $lookup: {
+        from: "users",
+        localField: "owner",
+        foreignField: "_id",
+        as: "owner",
+        pipeline: [
+          {
             $lookup: {
-                from: "likes",
-                localField: "_id",
-                foreignField: "video",
-                as: "likes",
+              from: "subscriptions",
+              localField: "_id",
+              foreignField: "channel",
+              as: "subscribers",
             }
-        },
-        {
-            $lookup: {
-                from: "users",
-                localField: "owner",
-                foreignField: "_id",
-                as: "owner",
-                pipeline: [
-                    {
-                        $lookup: {
-                            from: "subscriptions",
-                            localField: "_id",
-                            foreignField: "channel",
-                            as: "subscribers",
-                        }
-                    },
-                    {
-                        $addFields: {
-                            subscribersCount: {
-                                $size: { $ifNull: ["$subscribers", []] }
-                            },
-                            isSubscribed: {
-                                $cond: {
-                                    if: {
-                                        $in: [req.user?._id, "$subscribers.subscriber"]
-                                    },
-                                    then: true,
-                                    else: false,
-                                }
-                            }
-                        }
-                    },
-                    {
-                        $project: {
-                            username: 1,
-                            "avatar.url": 1,
-                            subscribersCount: 1,
-                            isSubscribed: 1
-                        }
-                    },
-                ],
-            }
-        },
-        {
+          },
+          {
             $addFields: {
-                likesCount: {
-                    $size: { $ifNull: ["$likes", []] }
-                },
-                owner: {
-                    $first: "$owner"
-                },
-                isLiked: {
-                    $cond: {
-                        if: {
-                            $in: [req.user?._id, "$likes.likedBy"]
-                        },
-                        then: true,
-                        else: false,
-                    },
-                }
+              subscribersCount: { $size: { $ifNull: ["$subscribers", []] } },
+              // Use $in where first arg is the user id constant and second is the array field
+              isSubscribed: {
+                $in: [userObjectId, { $ifNull: ["$subscribers.subscriber", []] }]
+              }
             }
-        },
-        {
+          },
+          {
             $project: {
-                "videoFile.url": 1,
-                title: 1,
-                description: 1,
-                views: 1,
-                createdAt: 1,
-                duration: 1,
-                comments: 1,
-                owner: 1,
-                likesCount: 1,
-                isLiked: 1,
+              username: 1,
+              "avatar.url": 1,
+              subscribersCount: 1,
+              isSubscribed: 1
             }
+          },
+        ],
+      }
+    },
+    {
+      $addFields: {
+        likesCount: { $size: { $ifNull: ["$likes", []] } },
+        owner: { $first: "$owner" },
+        isLiked: {
+          $in: [userObjectId, { $ifNull: ["$likes.likedBy", []] }]
         }
-    ]);
-
-    if(!video){
-        throw new ApiError(500, "failed to fetch video");
+      }
+    },
+    {
+      $project: {
+        "videoFile.url": 1,
+        title: 1,
+        description: 1,
+        views: 1,
+        createdAt: 1,
+        duration: 1,
+        comments: 1,
+        owner: 1,
+        likesCount: 1,
+        isLiked: 1,
+      }
     }
+  ]).allowDiskUse(true); // optional: for heavy aggregation
 
-    await Video.findByIdAndUpdate(
-        videoId,
-        {
-            $inc: {
-                views: 1,
-            }
-        },
-    );
+  if (!results || results.length === 0) {
+    throw new ApiError(404, "Video not found");
+  }
 
-    await User.findByIdAndUpdate(
-        req.user?._id,
-        {
-            $addToSet: {
-                watchHistory: videoId
-            }
-        }
-    )
+  const video = results[0];
 
-    return res
-        .status(200)
-        .json(
-            new ApiResponse(200, video[0], "video details fetched successfully")
-        );
-})
+  // Increment views (use ObjectId to be safe)
+  await Video.findByIdAndUpdate(videoId, { $inc: { views: 1 } });
+
+  // Add to user's watch history (use $addToSet with ObjectId)
+  await User.findByIdAndUpdate(userObjectId, {
+    $addToSet: { watchHistory: new mongoose.Types.ObjectId(videoId) }
+  });
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, video, "Video details fetched successfully"));
+});
 
 // update video details like title, description, thumbnail
 const updateVideo = asyncHandler(async(req, res) => {
@@ -465,4 +464,5 @@ export {
     getAllVideos,
     getVideoById,
     togglePublishStatus,
+    getMyVideos
 }
